@@ -1,8 +1,10 @@
-# convex-ad-jax
+# convex-ad
 
-A JAX port of [matteomasto/convex-ad](https://github.com/matteomasto/convex-ad)
-(a geometrically regularized differentiable model for BCDI phase retrieval),
-with three deliberate changes from the original TensorFlow implementation:
+<img width="1240" height="820" alt="image" src="https://github.com/user-attachments/assets/df4366b5-9a40-466b-a82e-a13eff3cfae0" />
+
+---
+Geometrically regularized automatic differentiation framework for BCDI phase retrieval.
+---
 
 1. **A hand-derived, memory-efficient adjoint for the half-space support op**,
    replacing the naive `(D, H, W, N)`-materializing version.
@@ -18,9 +20,6 @@ with three deliberate changes from the original TensorFlow implementation:
    parameterization (inverse stereographic projection) with no flat
    direction to drift into -- see the derivation comment at the top of
    `support.py`.
-3. **A population of independent L-BFGS restarts** (via `jax.vmap`, using
-   `optax.lbfgs`), instead of one Adam trajectory. The lowest-loss restart is
-   kept.
 
 ## Why a custom VJP for the half-space support
 
@@ -46,34 +45,6 @@ The Fourier data-fidelity term is *not* hand-differentiated: `jnp.fft` is
 linear, so JAX's built-in VJP is already an (adjoint) FFT with no extra
 activation storage -- there is nothing to improve there.
 
-## Why per-restart L-BFGS instead of one combined solve
-
-`n_restarts` random restarts of support + phase exist to raise the odds one
-lands near a good local minimum -- they are independent optimization
-problems that happen to share the same `Iobs`. A single L-BFGS run over the
-concatenation of all restarts' parameters would let the quasi-Newton
-curvature history mix information across unrelated restarts (their step
-sizes and directions would become spuriously correlated), which is wrong for
-this use case. `jax.vmap` over an `optax.lbfgs`-based single-instance solve
-keeps every restart's optimizer state fully independent; the best one is
-selected post hoc by `jnp.argmin` over final losses.
-
-`optax.lbfgs` is a real limited-memory L-BFGS (short history buffer, not a
-dense Hessian) -- a dense `(P, P)` BFGS approximation would be infeasible
-here since `P` (params per restart) can reach several million for the
-largest grids.
-
-**Memory note:** at the largest grid sizes, the L-BFGS history
-(`~2 * memory_size * n_params` floats per restart) is typically the dominant
-per-restart cost -- more than the (now O(D*H*W)) support op or the FFT
-buffers. Lower `memory_size` (e.g. 3-5) to fit more parallel restarts if
-you need to.
-
-**Lockstep caveat:** because restarts are vmapped over a `lax.while_loop`,
-all lanes run until *every* lane satisfies its stopping criterion (no
-per-lane early exit under vmap). Restarts that converge early just perform
-cheap extra steps afterwards; this costs wall-clock time but does not affect
-correctness.
 
 ## Package layout
 
@@ -124,83 +95,4 @@ support, amplitude, phase = result.evaluate(Iobs)
 
 See `examples/run_reconstruction.py` for a complete script.
 
-## Bugs found and fixed (vs. earlier versions of this port)
 
-Three real issues were found by diffing against the actual upstream source
-and by profiling actual optimizer runs, rather than by inspection alone.
-
-1. **A missing gradient mask at the support's clip boundary.** The forward
-   pass computes `log(clip(sigma, 1e-6, 1.0))`, so wherever `sigma` is
-   clipped the true derivative is exactly zero -- but the custom VJP's
-   backward pass used the unclipped sigmoid derivative unconditionally,
-   injecting a small but nonzero spurious gradient into every saturated
-   voxel for every plane. A targeted finite-difference test (holding one
-   plane deep in saturation across an entire grid) showed an analytic
-   gradient of `0.0096` against a finite-difference gradient of exactly
-   `0`. This error is small per-voxel but **scales with total grid
-   volume**, while genuine boundary-driven gradient signal only scales
-   with grid surface area -- so it gets relatively worse at large,
-   realistic BCDI grid sizes even though it was invisible in this
-   project's original small-grid gradient checks. Fixed in
-   `support._halfspace_support_bwd` by masking with `1e-6 < sigma < 1.0`.
-2. **Redundant sphere parameterization degrading L-BFGS.** An earlier
-   version used `n = n_raw / ||n_raw||` with a free `n_raw in R^3` (3
-   parameters for a 2-DOF constraint) -- valid but leaves a flat "gauge"
-   direction. Profiling an actual `optax.lbfgs` run showed `||n_raw||`
-   drifting 2.0 -> 7.4 over 80 steps purely from history mixing, silently
-   shrinking the useful gradient (which scales as `1/||n_raw||`). Fixed
-   with a minimal 2-DOF stereographic parameterization
-   (`support.stereographic_to_unit`); the same diagnostic now shows drift
-   of only 2.08 -> 2.88, and that remaining drift is legitimate motion in
-   a genuinely-curved space, not a flat direction.
-3. **Wrong phase representation for `phase_type='displacement'`.** The
-   original `core.py` dispatches with
-   `hasattr(self.phaser, "compute_phasor")`; both `GridPhasor` and
-   `DisplacementPhasor` define `compute_phasor`, so the original always
-   uses the `(cos, sin)` tuple form for both, never the raw scalar phase.
-   Fixed in `model.forward`. (Silent when `beta=0`; changes
-   `losses.tv_loss_phase`'s behavior when `beta>0`.)
-
-## L-BFGS vs. Adam: an empirical correction
-
-The original design argument for L-BFGS (in an earlier iteration of this
-project's discussion) was that this problem is deterministic and smooth,
-which is exactly L-BFGS's favorable regime. **That argument turned out to
-be wrong about the "smooth" part**, and the fixes above were not enough
-to close the gap with the original TensorFlow + Adam baseline on their
-own. A self-consistency test -- reconstructing a target generated by this
-exact forward model, so near-perfect recovery is achievable in principle
--- showed why: L-BFGS's loss trace dropped fast for ~40 steps then
-**stalled around 0.085-0.10 for the remaining 260 of a 300-step budget**,
-despite a nonzero gradient norm (0.02-0.1) throughout -- genuine
-cycling/stalling, not convergence. Plain Adam on the identical problem
-reached ~0.02-0.024 in the same budget, and several Adam-then-L-BFGS
-warm-start schedules were tried and still underperformed plain Adam.
-
-The likely cause: `mae`'s `abs()` and the support's `clip()` both
-introduce kinks, and L-BFGS's curvature history is corrupted by (s, y)
-pairs collected across them -- the "exact, deterministic gradients favor
-quasi-Newton methods" argument implicitly assumed a smooth objective,
-which this isn't.
-
-**`reconstruct(..., optimizer=...)` now defaults to `"adam"`** for this
-reason, matching the original TensorFlow baseline's choice.
-`optimizer="lbfgs"` remains available (e.g. for fine-tuning the last mile
-after your own Adam run, or if you modify the loss to remove its kinks --
-a smooth L1 approximation in place of MAE's `abs()` would be the natural
-first thing to try if you want to revisit L-BFGS).
-
-If reconstruction quality still trails the original after all of this,
-`memory_size` (only relevant to `optimizer="lbfgs"`) and the population
-size / random-init distribution are the next things worth checking.
-
-### A note on `jax.jit`
-
-`reconstruct` is not wrapped in an explicit `jax.jit`, and does not need to
-be: the numerically heavy part (`jax.vmap` over an `lax.while_loop`-based
-L-BFGS solve) is already compiled to a single XLA program by JAX's runtime
-when it runs. If you wrap `reconstruct` itself in `jax.jit`, note that its
-return value carries `phase_static`, a small dict containing a Python string
-(`phase_type`) -- `jit` cannot trace a string-valued *output*. Either strip
-`phase_static` from what you jit, or jit a narrower function of your own
-that consumes purely numeric arrays.
