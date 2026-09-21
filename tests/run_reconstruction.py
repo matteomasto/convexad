@@ -6,7 +6,7 @@ import time
 import jax
 import numpy as np
 
-from convex_ad_jax import reconstruct
+from convexad import reconstruct
 
 # ------------------------------------------------------------------
 # Load your diffraction data (replace with a real dataset).

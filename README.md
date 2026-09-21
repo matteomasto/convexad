@@ -34,7 +34,7 @@ of `125x225x225 ~= 6.33M` voxels, `N` up to `256`):
 ```
 
 which does not fit a 32 GB GPU budget once FFT buffers and L-BFGS history are
-also resident. `src/convex_ad_jax/support.py` instead `lax.scan`s over the
+also resident. `src/convexad/support.py` instead `lax.scan`s over the
 `N` half-spaces, keeping only a running `(D, H, W)` log-support accumulator,
 and recomputes `sigma_i` per-plane in the backward pass rather than storing
 it. Peak extra memory becomes `O(D*H*W)`, independent of `N`. The analytic
@@ -49,7 +49,7 @@ activation storage -- there is nothing to improve there.
 ## Package layout
 
 ```
-src/convex_ad_jax/
+src/convexad/
     support.py    # HalfSpaceSupport equivalent + custom_vjp
     phase.py      # GridPhase / GridPhasor / DisplacementPhasor equivalents
     losses.py     # mae, poisson_kl, fourier_loss, tv_loss_phase, total_loss
@@ -80,7 +80,7 @@ grid sizes you'll want a CUDA-enabled `jax[cuda12]` install.
 ```python
 import jax
 import numpy as np
-from convex_ad_jax import reconstruct
+from convexad import reconstruct
 
 Iobs = np.load("data.npz")["I"].astype(np.float32)
 

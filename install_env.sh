@@ -34,9 +34,9 @@ PIP="$ENV_PREFIX/bin/pip"
 # ── 6. cdiutils ──
 "$PIP" install --no-cache-dir cdiutils
 
-# ── 7. convex_ad_jax from GitHub (editable, explicit clone) ──
-git clone https://github.com/matteomasto/convexad_jax.git "${ENV_PREFIX}/src/convexad_jax"
-"$PIP" install --no-cache-dir -e "${ENV_PREFIX}/src/convexad_jax"
+# ── 7. convexad from GitHub (editable, explicit clone) ──
+git clone https://github.com/matteomasto/convexad.git "${ENV_PREFIX}/src/convexad"
+"$PIP" install --no-cache-dir -e "${ENV_PREFIX}/src/convexad"
 
 # ── 8. Register as a Jupyter kernel ──
 "$PY" -m ipykernel install --user \
@@ -47,5 +47,5 @@ echo "--- jax ---";        "$PY" -c "import jax; print(jax.__version__); print(j
 echo "--- pynx ---";       "$ENV_PREFIX/bin/pynx-info"
 echo "--- pyvkfft ---";    "$ENV_PREFIX/bin/pyvkfft-info"
 echo "--- cdiutils ---";   "$PY" -c "import cdiutils; print(cdiutils.__version__)"
-echo "--- convex_ad_jax ---"; "$PY" -c "from convex_ad_jax import reconstruct; print('ok')"
+echo "--- convexad ---"; "$PY" -c "from convexad import reconstruct; print('ok')"
 echo "--- numpy ---";      "$PY" -c "import numpy; print(numpy.__version__)"

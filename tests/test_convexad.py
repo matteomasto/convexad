@@ -11,14 +11,14 @@ import pytest
 
 jax.config.update("jax_platform_name", "cpu")
 
-from convex_ad_jax.support import (
+from convexad.support import (
     make_coords, halfspace_support, init_support_params, compute_support,
     stereographic_to_unit, unit_to_stereographic,
 )
-from convex_ad_jax.multi_support import init_multi_support_params, compute_multi_support
-from convex_ad_jax.model import init_model, forward, loss_fn, make_coords_for
-from convex_ad_jax.optimize import reconstruct, init_population
-from convex_ad_jax.utils import center_pad, project, save_params_npz, load_params_npz
+from convexad.multi_support import init_multi_support_params, compute_multi_support
+from convexad.model import init_model, forward, loss_fn, make_coords_for
+from convexad.optimize import reconstruct, init_population
+from convexad.utils import center_pad, project, save_params_npz, load_params_npz
 
 
 def test_stereographic_round_trip():
