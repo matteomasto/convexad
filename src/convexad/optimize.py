@@ -1,24 +1,7 @@
 # =============================================================================
 # OPTIMIZATION
 # =============================================================================
-# Each population member (random restart of support + phase) is an
-# independent, deterministic optimization problem sharing only Iobs -- there
-# is no minibatch stochasticity here, which is exactly the regime L-BFGS is
-# built for. Critically, the population members must NOT share one global
-# L-BFGS step: L-BFGS's curvature history mixes information across the whole
-# flattened parameter vector, so a single combined solve would spuriously
-# correlate unrelated restarts' step sizes and directions. Instead we vmap an
-# independent L-BFGS solve over the population axis (in_axes=0 on params,
-# in_axes=None on the shared static data/config) and pick the argmin loss.
-#
-# We use optax.lbfgs (a real limited-memory L-BFGS with a Hessian
-# approximation implicit in a short history buffer, not a dense (P, P)
-# matrix -- with grid sizes up to ~6.3M voxels a dense BFGS Hessian would be
-# infeasible). Peak memory added by the solver's own state is
-# ~ 2 * memory_size * (#params) floats, independent of everything except
-# the history depth -- this is usually the dominant per-restart memory cost
-# at the largest grid sizes, more than the (now O(D*H*W)) support op or the
-# FFT buffers. Reduce `memory_size` first if you need to fit more restarts.
+
 from functools import partial
 from typing import NamedTuple, Optional
 
@@ -26,8 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 import optax
-# from jax.flatten_util import ravel_pytree
-# import jax.scipy.sparse.linalg as jsla
 
 from .losses import compute_Icalc, _center_pad
 from .model import init_model, init_params_only, make_coords_for, loss_fn, forward
@@ -77,164 +58,6 @@ def _jvp_via_vjp(f_vjp, y_like, v):
     _, h_vjp = jax.vjp(h, jnp.zeros_like(y_like))
     return h_vjp(v)[0]
 
-
-# def _newton_step_size(params, grad, direction, static, schedule_alpha, alpha_multiplier=5.0):
-#     """Bilinear-Hessian Newton step size (Carlsson et al. 2025, eq. 20):
-#     alpha = -<grad, s> / H|params(s, s), s = -direction.
-
-#     H is exact for o -> Icalc -> metric (closed form, one extra FFT); the
-#     params -> o layer (support's halfspace_support, amplitude's Parseval
-#     normalization, phase's Qnorm*u or phasor) goes through _jvp_via_vjp on
-#     the SAME forward() grad already uses -- Qnorm's chain-rule contribution
-#     is picked up automatically and exactly, no special-casing needed for
-#     phase_type="displacement". See module notes on why this is safe to mix
-#     with Qnorm's existing benefit under AMSGrad, and the one real caveat:
-#     alpha is a single global scalar over the whole (support, phase)
-#     direction, not a per-block step size.
-
-#     metric must be 'mse' or 'poisson' -- matches losses.mse (sqrt/amplitude
-#     domain) and losses.poisson_kl (raw intensity domain) exactly, each in
-#     its own correct domain. 'mae' is unsupported: h''(I)=0 a.e. for it.
-
-#     Falls back to `schedule_alpha` when H(s,s) <= 0 or the result isn't
-#     finite; alpha_max = alpha_multiplier * schedule_alpha (dynamic, tied
-#     to the schedule's current value rather than a fixed constant).
-#     """
-#     metric = static["metric"]
-#     if metric not in ("mse", "poisson"):
-#         raise ValueError(
-#             f"Newton step size only supports metric='mse' or 'poisson' "
-#             f"(mae's bilinear Hessian is 0 a.e.), got {metric!r}."
-#         )
-
-#     s = jax.tree_util.tree_map(lambda d: -d, direction)
-
-#     def field_fn(p):
-#         support, amplitude, phase = forward(
-#             p, static["coords"], static["Iobs"], static["eps"],
-#             static["phase_static"],
-#             stop_amplitude_grad=static.get("stop_amplitude_grad", False),
-#         )
-#         modulus = support * amplitude
-#         if isinstance(phase, tuple):
-#             c, sn = phase
-#             return jax.lax.complex(modulus * c, modulus * sn)
-#         return jax.lax.complex(modulus * jnp.cos(phase), modulus * jnp.sin(phase))
-
-#     o, field_vjp = jax.vjp(field_fn, params)
-#     delta_o = _jvp_via_vjp(field_vjp, o, s)
-
-#     Iobs = static["Iobs"].astype(jnp.float32)
-#     o_p = _center_pad(o, Iobs.shape)
-#     do_p = _center_pad(delta_o, Iobs.shape)
-
-#     z   = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(o_p)))
-#     Fdo = jnp.fft.ifftshift(jnp.fft.fftn(jnp.fft.fftshift(do_p)))
-
-#     Icalc   = jnp.abs(z) ** 2
-#     dIcalc  = 2.0 * jnp.real(jnp.conj(z) * Fdo)
-#     d2Icalc = 2.0 * jnp.abs(Fdo) ** 2
-
-#     if metric == "mse":
-#         D_norm = jnp.sum(jnp.sqrt(Iobs))
-#         Icalc_safe = jnp.clip(Icalc, 1e-12, None)
-#         sqrtI = jnp.sqrt(Icalc_safe)
-#         r = jnp.sqrt(Iobs) - sqrtI
-#         h_prime = -r / (D_norm * sqrtI)
-#         h_double_prime = jnp.sqrt(Iobs) / (2.0 * D_norm * sqrtI ** 3)
-#     else:  # "poisson"
-#         N = Iobs.size
-#         Icalc_safe = jnp.clip(Icalc, 1e-12, None)
-#         h_prime = (1.0 - Iobs / Icalc_safe) / N
-#         h_double_prime = (Iobs / Icalc_safe ** 2) / N
-
-#     HH = jnp.sum(h_double_prime * dIcalc ** 2 + h_prime * d2Icalc)
-
-#     grad_dot_s = sum(
-#         jnp.sum(g * si) for g, si in zip(
-#             jax.tree_util.tree_leaves(grad), jax.tree_util.tree_leaves(s)
-#         )
-#     )
-#     alpha_newton = -grad_dot_s / HH
-
-#     alpha_max = alpha_multiplier * schedule_alpha
-#     valid = jnp.logical_and(HH > 0, jnp.isfinite(alpha_newton))
-#     return jnp.where(valid, jnp.clip(alpha_newton, 0.0, alpha_max), schedule_alpha)
-    
-# def _solve_one_adam(
-#     params0, static, max_steps, tol, learning_rate,
-#     decay_steps=500, decay_rate=0.9, staircase=True,
-#     b1=0.9, b2=0.98, eps_adam=1e-6,
-#     variant="amsgrad",   # NEW: "amsgrad" | "adabelief" | "lion"
-# ):
-#     """Single-instance solve with LR decay, run for a fixed number of steps
-#     (or until gradient norm drops below `tol`).
-
-#     variant : "amsgrad" (default) | "adabelief" | "lion"
-#         All three are optax.GradientTransformations composed with the same
-#         exponential-decay LR schedule, so cond_fn/body_fn below are
-#         unchanged regardless of variant.
-#         - "amsgrad": current default, unchanged.
-#         - "adabelief": scales the step by deviation of the gradient from
-#           its own EMA ("belief") rather than raw magnitude -- worth trying
-#           given the support gradient's clip-boundary masking (active flag
-#           in halfspace_support) makes some voxels' gradients intermittently
-#           hard-zero, which AdaBelief may register as "low belief" more
-#           precisely than AMSGrad's raw-magnitude second moment does.
-#         - "lion": sign-of-momentum updates, no second-moment state at all
-#           -- every parameter gets the same step magnitude regardless of
-#           its raw gradient scale, which is a more forceful answer to the
-#           support/amplitude/phase block-scale disparity than any adaptive
-#           second-moment method. Needs its own learning_rate tuning: per
-#           the optax docs, Lion's suitable LR is typically 3-10x smaller
-#           than Adam's for the same problem -- don't reuse the AMSGrad
-#           `learning_rate` value unchanged when testing this variant.
-
-#     ** Empirical finding, not just a theoretical concern: ** on this
-#     project's actual loss (MAE has an `abs()` kink; the half-space support
-#     has a `clip()` kink), a self-consistency test ... [unchanged]
-#     """
-#     schedule = optax.exponential_decay(
-#         init_value=learning_rate,
-#         transition_steps=decay_steps,
-#         decay_rate=decay_rate,
-#         staircase=staircase,
-#     )
-
-#     if variant == "amsgrad":
-#         scale = optax.scale_by_amsgrad(b1=b1, b2=b2, eps=eps_adam)
-#     elif variant == "adabelief":
-#         scale = optax.scale_by_belief(b1=b1, b2=b2, eps=eps_adam)
-#     elif variant == "lion":
-#         scale = optax.scale_by_lion(b1=b1, b2=0.99)  # b2 default per optax; b1 shared with caller
-#     else:
-#         raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
-
-#     solver = optax.chain(scale, optax.scale_by_learning_rate(schedule))
-
-#     def f(p):
-#         return loss_fn(p, static)
-
-#     opt_state0 = solver.init(params0)
-#     value0, grad0 = jax.value_and_grad(f)(params0)
-
-#     def cond_fn(carry):
-#         step, _params, _state, _value, grad = carry
-#         gnorm = optax.tree.norm(grad)
-#         return jnp.logical_and(step < max_steps, gnorm > tol)
-
-#     def body_fn(carry):
-#         step, params, opt_state, value, grad = carry
-#         updates, opt_state = solver.update(grad, opt_state, params)
-#         params = optax.apply_updates(params, updates)
-#         value, grad = jax.value_and_grad(f)(params)
-#         return (step + 1, params, opt_state, value, grad)
-
-#     init_carry = (jnp.asarray(0), params0, opt_state0, value0, grad0)
-#     final_step, final_params, _final_state, final_value, _final_grad = lax.while_loop(
-#         cond_fn, body_fn, init_carry
-#     )
-#     return final_params, final_value, final_step
 
 def _solve_one_adam(
     params0, static, max_steps, tol, learning_rate,
