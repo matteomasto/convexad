@@ -2,6 +2,7 @@
 # OPTIMIZATION
 # =============================================================================
 
+import time
 from functools import partial
 from typing import Any, NamedTuple, Optional
 
@@ -200,6 +201,18 @@ def _advance_population(params, opt_state, steps, stop, data, hp, cfg):
     return jax.vmap(one)(params, opt_state, steps, stop)
 
 
+def _is_ready(x):
+    return all(getattr(leaf, "is_ready", lambda: True)()
+               for leaf in jax.tree_util.tree_leaves(x))
+
+
+def _wait(x):
+    """Return once every array in `x` has been computed. Polls instead of blocking
+    so that a KeyboardInterrupt is raised at once, not when the chunk ends."""
+    while not _is_ready(x):
+        time.sleep(0.005)
+
+
 def reconstruct(
     key, Iobs, n_restarts, N=64, size_factor=4.0, eps=0.6, alpha=0.8, beta=0.1,
     metric="mae", phase_type="grid", phase_kwargs=None, support_type="single",
@@ -212,15 +225,18 @@ def reconstruct(
 ):
     """Run `n_restarts` independent optimizations in parallel and keep the best.
 
-    The optimization advances `chunk` steps at a time, so it can be stopped
-    between chunks: interrupt the kernel (or press Ctrl-C) and the result so
-    far is returned instead of an exception. Pass it back as `resume=result`
-    to continue from the same parameters, optimizer state and step count, with
-    new values of `eps`, `alpha`, `beta`, `learning_rate`, `tol` or `max_steps`
-    (a total number of steps, not an increment). Changing these does not
-    recompile. Everything else must be as in the first call; `key`, `n_restarts`
-    and the model arguments are ignored when resuming. An interrupt takes
-    effect when the current chunk finishes.
+    The optimization advances `chunk` steps at a time. Interrupt the kernel (or
+    press Ctrl-C) and `reconstruct` returns at once, instead of raising, with
+    the result as of the last finished chunk, i.e. the last progress line
+    printed. You can inspect it (`result.evaluate(Iobs)`, `result.all_losses`,
+    ...); the chunk that was running is dropped. If you interrupt before the
+    first chunk has finished, the result is the initial state, with NaN losses.
+    Pass it back as `resume=result` to continue from the same parameters,
+    optimizer state and step count, with new values of `eps`, `alpha`, `beta`,
+    `learning_rate`, `tol` or `max_steps` (a total number of steps, not an
+    increment). Changing these does not recompile. Everything else must be as
+    in the first call; `key`, `n_restarts` and the model arguments are ignored
+    when resuming.
     """
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
 
@@ -253,18 +269,18 @@ def reconstruct(
           dict(eps=eps, alpha=alpha, beta=beta, lr=learning_rate, tol=tol).items()}
     data = {"coords": coords, "Iobs": Iobs}
 
-    # One tuple, replaced in one assignment: an interrupt can never leave it
-    # half updated.
-    carry = (params, opt_state, steps, None)      # (params, opt_state, steps, losses)
+    # `carry` is always a complete state: the initial one, replaced (in one
+    # assignment) by each finished chunk. `pending` is the chunk being computed.
+    carry = (params, opt_state, steps, jnp.full(steps.shape, jnp.nan))
+    pending = None
     try:
         while True:
-            p, s, k, _ = carry
-            new = _advance_population(
-                p, s, k, jnp.minimum(k + chunk, max_steps), data, hp, cfg,
+            pending = _advance_population(
+                *carry[:3], jnp.minimum(carry[2] + chunk, max_steps), data, hp, cfg,
             )
-            jax.block_until_ready(new)
-            moved = bool(jnp.any(new[2] > k))
-            carry = new
+            _wait(pending)
+            moved = bool(jnp.any(pending[2] > carry[2]))
+            carry, pending = pending, None
             if verbose:
                 print(f"\rstep {int(carry[2].max())}/{max_steps}   "
                       f"best loss {float(carry[3].min()):.6g}", end="", flush=True)
@@ -273,10 +289,11 @@ def reconstruct(
         if verbose:
             print()
     except KeyboardInterrupt:
-        if carry[3] is None:
-            raise
+        if pending is not None and _is_ready(pending):
+            carry = pending     # it had just finished; never wait for one that has not
         if verbose:
-            print("\ninterrupted: pass resume=result to continue")
+            print(f"\ninterrupted at step {int(carry[2].max())}: "
+                  "pass resume=result to continue")
     params, opt_state, steps, values = carry
 
     best_idx = jnp.argmin(values)
