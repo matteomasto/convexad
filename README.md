@@ -8,7 +8,7 @@ Geometrically regularized automatic differentiation framework for BCDI phase ret
 
 ConvexAD is a gradient based phase retrieval tool for Bragg coherent diffraction imaging (BCDI), built on JAX with native GPU acceleration. Instead of alternating projections, it encodes prior knowledge in a differentiable model of the object and fits the measured intensity by gradient descent.
 
-* **Support.** A convex polytope, the soft intersection of `N` half spaces. Non convex objects are modeled as a union of convex parts.
+* **Support.** A convex polytope, the soft intersection of `N` half spaces. (Non convex objects, modeled as a union of convex parts, are still under development, not available for the moment).
 * **Phase.** Free per voxel, a phasor, or a displacement field along the scattering vector.
 * **Amplitude.** Constant inside the support and set analytically from Parseval's theorem, not trained.
 * **Restarts.** Many random restarts run in parallel and the one with the lowest loss is kept.
