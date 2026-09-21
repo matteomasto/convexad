@@ -3,7 +3,7 @@
 # =============================================================================
 
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import jax
 import jax.numpy as jnp
@@ -58,40 +58,17 @@ def _jvp_via_vjp(f_vjp, y_like, v):
     _, h_vjp = jax.vjp(h, jnp.zeros_like(y_like))
     return h_vjp(v)[0]
 
+def _make_solver(learning_rate, decay_steps, decay_rate, staircase, b1, b2,
+                 eps_adam, variant, clip_norm):
+    """optax chain: [global norm clip] -> scale_by_<variant> -> decaying learning rate.
 
-def _solve_one_adam(
-    params0, static, max_steps, tol, learning_rate,
-    decay_steps=500, decay_rate=0.9, staircase=True,
-    b1=0.9, b2=0.98, eps_adam=1e-6,
-    variant="amsgrad",
-    clip_norm=None,       # global gradient-norm clip, applied before scale_by_*
-    sign_grad=False,      # use sign(grad) as the direction fed to scale_by_*
-):
-    """... existing docstring ...
-
-    clip_norm : float or None
-        If set, clips the global L2 norm of the raw gradient to this value
-        before AMSGrad/AdaBelief/Lion normalization -- a bounded-magnitude
-        gradient regardless of how wrong the current point is, testing
-        whether `mae`+Adam's advantage on this landscape is really "bounded
-        step size" rather than anything MAE-specific. Composes with any
-        `variant`.
-    sign_grad : bool
-        If True, replaces the gradient with elementwise sign(grad) before
-        it reaches scale_by_*, i.e. every voxel/parameter contributes a
-        fixed-magnitude push in its gradient's direction only -- a closer
-        structural match to mae's own gradient (+-1/sum(Iobs) per voxel,
-        magnitude-independent of the residual) than clip_norm is. Mutually
-        compatible with clip_norm (sign first would make clipping a
-        no-op on magnitude; apply clip_norm to the raw gradient, sign_grad
-        replaces it entirely -- if both are set, sign_grad wins, since
-        clipping a vector of +-1's does nothing meaningful).
+    `learning_rate` may be a traced scalar. The chain's state does not depend on
+    its value, so the same optimizer state can be reused after changing it.
     """
     schedule = optax.exponential_decay(
         init_value=learning_rate, transition_steps=decay_steps,
         decay_rate=decay_rate, staircase=staircase,
     )
-
     if variant == "amsgrad":
         scale = optax.scale_by_amsgrad(b1=b1, b2=b2, eps=eps_adam)
     elif variant == "adabelief":
@@ -100,41 +77,62 @@ def _solve_one_adam(
         scale = optax.scale_by_lion(b1=b1, b2=0.99)
     else:
         raise ValueError(f"Unknown variant: {variant!r}, choose 'amsgrad', 'adabelief' or 'lion'.")
-
     transforms = []
     if clip_norm is not None:
         transforms.append(optax.clip_by_global_norm(clip_norm))
     transforms.append(scale)
     transforms.append(optax.scale_by_learning_rate(schedule))
-    solver = optax.chain(*transforms)
+    return optax.chain(*transforms)
 
+
+def _advance(params, opt_state, step, stop, static, tol, solver, sign_grad=False):
+    """Single instance: take solver steps from (params, opt_state, step) until
+    `step == stop` or the gradient norm falls below `tol`. The loss and gradient
+    are re-evaluated on entry, so `static` (eps, alpha, beta, ...) can differ from
+    the previous call. Returns (params, opt_state, step, loss at the returned params).
+    """
     def f(p):
         return loss_fn(p, static)
 
-    opt_state0 = solver.init(params0)
-    value0, grad0 = jax.value_and_grad(f)(params0)
+    value0, grad0 = jax.value_and_grad(f)(params)
 
     def cond_fn(carry):
         step, _params, _state, _value, grad = carry
-        return jnp.logical_and(step < max_steps, optax.tree.norm(grad) > tol)
+        return jnp.logical_and(step < stop, optax.tree.norm(grad) > tol)
 
     def body_fn(carry):
         step, params, opt_state, value, grad = carry
-
-        grad_for_update = (
-            jax.tree_util.tree_map(jnp.sign, grad) if sign_grad else grad
-        )
+        grad_for_update = jax.tree_util.tree_map(jnp.sign, grad) if sign_grad else grad
         direction, opt_state = solver.update(grad_for_update, opt_state, params)
-
-        params = optax.apply_updates(params, direction)   # was: `updates` (undefined)
+        params = optax.apply_updates(params, direction)
         value, grad = jax.value_and_grad(f)(params)
         return (step + 1, params, opt_state, value, grad)
 
-    init_carry = (jnp.asarray(0), params0, opt_state0, value0, grad0)
-    final_step, final_params, _final_state, final_value, _final_grad = lax.while_loop(
-        cond_fn, body_fn, init_carry
+    step, params, opt_state, value, _grad = lax.while_loop(
+        cond_fn, body_fn, (step, params, opt_state, value0, grad0)
     )
-    return final_params, final_value, final_step
+    return params, opt_state, step, value
+    
+def _solve_one_adam(
+    params0, static, max_steps, tol, learning_rate,
+    decay_steps=500, decay_rate=0.9, staircase=True,
+    b1=0.9, b2=0.98, eps_adam=1e-6,
+    variant="amsgrad",
+    clip_norm=None,       # global gradient-norm clip, applied before scale_by_*
+    sign_grad=False,      # use sign(grad) as the direction fed to scale_by_*
+):
+    """
+    Solver with different optimizers
+    """
+    solver = _make_solver(
+        learning_rate, decay_steps, decay_rate, staircase, b1, b2, eps_adam,
+        variant, clip_norm,
+    )
+    params, _state, step, value = _advance(
+        params0, solver.init(params0), jnp.asarray(0), max_steps, static, tol,
+        solver, sign_grad,
+    )
+    return params, value, step
     
 def residual_fn(params, static):
     """Amplitude-domain residual whose sum-of-squares equals `mse`
@@ -160,342 +158,131 @@ class ReconstructionResult(NamedTuple):
     model_static: dict         # shared; phase_type/support_type/etc.
     eps: float
     all_params: Optional[dict] = None
+    opt_state: Optional[Any] = None   # (n_restarts, ...) optimizer state, needed to resume
 
     def evaluate(self, Iobs):
         """Recompute (support, amplitude, phase) for the best restart."""
         return forward(self.best_params, self.coords, Iobs, self.eps, self.model_static)
 
 
-def reconstruct(
-    key,
-    Iobs,
-    n_restarts,
-    N=64,
-    size_factor=4.0,
-    eps=0.6,
-    alpha=0.8,
-    beta=0.1,
-    metric="mae",
-    phase_type="grid",
-    phase_kwargs=None,
-    support_type="single",
-    support_kwargs=None,
-    max_steps=5000,
-    tol=1e-6,
-    learning_rate=0.05,
-    decay_steps=500,
-    decay_rate=0.9,
-    staircase=True,
-    b1=0.9,
-    b2=0.98,
-    eps_adam=1e-6,
-    grid_shape=None,
-    variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
-    stop_amplitude_grad=False,    # restored
-    clip_norm=None,     # NEW
-    sign_grad=False,    # NEW
-):
-    Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
-    if grid_shape is None:
-        grid_shape, coords = make_coords_for(Iobs.shape)
-    else:
-        from .support import make_coords
-        coords = make_coords(grid_shape)
+def _freeze(d):
+    """Hashable copy of a small static dict (scalar arrays become floats), so
+    jax.jit can cache on it."""
+    return tuple(sorted(
+        (k, float(v) if getattr(v, "shape", None) == () else v) for k, v in d.items()
+    ))
 
-    params0, model_static = init_population(
-        key, n_restarts, grid_shape, N=N, size_factor=size_factor,
-        phase_type=phase_type, phase_kwargs=phase_kwargs,
-        support_type=support_type, support_kwargs=support_kwargs,
-    )
 
+@partial(jax.jit, static_argnames=("cfg",))
+def _advance_population(params, opt_state, steps, stop, data, hp, cfg):
+    """Advance every restart by up to `stop - steps` solver steps.
+
+    Everything that may change between calls (eps, alpha, beta, learning rate,
+    tol, the data, the step limits) is a traced argument, so editing it does
+    not recompile; `cfg` holds the structural settings and is static.
+    """
+    (metric, stop_amplitude_grad, variant, clip_norm, sign_grad, decay_steps,
+     decay_rate, staircase, b1, b2, eps_adam, phase_static) = cfg
     static = {
-        "coords": coords,
-        "Iobs": Iobs,
-        "eps": eps,
-        "alpha": alpha,
-        "beta": beta,
-        "metric": metric,
-        "phase_static": model_static,
+        "coords": data["coords"], "Iobs": data["Iobs"],
+        "eps": hp["eps"], "alpha": hp["alpha"], "beta": hp["beta"],
+        "metric": metric, "phase_static": dict(phase_static),
         "stop_amplitude_grad": stop_amplitude_grad,
     }
-
-    solve = partial(
-        _solve_one_adam, static=static, max_steps=max_steps, tol=tol,
-        learning_rate=learning_rate, decay_steps=decay_steps,
-        decay_rate=decay_rate, staircase=staircase,
-        b1=b1, b2=b2, eps_adam=eps_adam, variant=variant,
-        clip_norm=clip_norm, sign_grad=sign_grad,
-    )
-    batched_solve = jax.vmap(solve, in_axes=(0,))
-
-    final_params, final_values, final_steps = batched_solve(params0)
-
-    best_idx = jnp.argmin(final_values)
-    best_params = jax.tree_util.tree_map(lambda x: x[best_idx], final_params)
-
-    return ReconstructionResult(
-        best_params=best_params,
-        best_loss=final_values[best_idx],
-        all_losses=final_values,
-        all_steps=final_steps,
-        coords=coords,
-        model_static=model_static,
-        eps=eps,
-        all_params=final_params,
+    solver = _make_solver(
+        hp["lr"], decay_steps, decay_rate, staircase, b1, b2, eps_adam,
+        variant, clip_norm,
     )
 
+    def one(p, s, k, stp):
+        return _advance(p, s, k, stp, static, hp["tol"], solver, sign_grad)
 
-# =============================================================================
-# TWO-STAGE (CONVEX -> FREE-FORM) RECONSTRUCTION
-# =============================================================================
-# Stage 1 is a normal `reconstruct(..., support_type="single" | "multi")`
-# population solve: cheap (O(N) or O(M*N) support params/restart), and its
-# job is only to find the rough global shape and phase field, robustly,
-# via the usual multi-restart search.
-#
-# Stage 2 releases a SMALL number of the best stage-1 restarts to the
-# free-form (support_freeform.py) voxel-grid support and refines them,
-# each anchored to its own stage-1 shape via a T (sharpness) / zeta
-# (anchor weight) continuation schedule that starts tight (trust the
-# stage-1 shape) and relaxes (let genuinely non-convex detail -- a twin
-# facet, a second particle, a concave notch -- emerge). See
-# support_freeform.py's module docstring for why a cold free-form start is
-# a bad idea.
+    return jax.vmap(one)(params, opt_state, steps, stop)
 
-def _solve_one_adam_freeform(
-    params0, S_ref, base_static, stage_schedule, tol,
-    learning_rate, decay_steps, decay_rate, staircase, b1, b2, eps_adam,
+
+def reconstruct(
+    key, Iobs, n_restarts, N=64, size_factor=4.0, eps=0.6, alpha=0.8, beta=0.1,
+    metric="mae", phase_type="grid", phase_kwargs=None, support_type="single",
+    support_kwargs=None, max_steps=5000, tol=1e-6, learning_rate=0.05,
+    decay_steps=500, decay_rate=0.9, staircase=True, b1=0.9, b2=0.98,
+    eps_adam=1e-6, grid_shape=None,
+    variant="amsgrad",            # "amsgrad" | "adabelief" | "lion"
+    stop_amplitude_grad=False, clip_norm=None, sign_grad=False,
+    resume=None, chunk=100, verbose=True,
 ):
-    """Single-instance staged Adam solve for the free-form support.
+    """Run `n_restarts` independent optimizations in parallel and keep the best.
 
-    Unlike `_solve_one_adam`, `S_ref` (this restart's anchor target -- the
-    stage-1 support it was warm-started from) is an explicit argument
-    rather than folded into `base_static`, specifically so it can vary per
-    population member under `vmap(..., in_axes=(0, 0))` while
-    `base_static` (Iobs, coords, alpha, beta, gamma, delta, metric,
-    phase_static) stays shared (`in_axes=None`). This is what lets several
-    kept stage-1 restarts be released to free-form in parallel, each
-    anchored to its own stage-1 solution, instead of all sharing one.
-
-    `stage_schedule` is a small Python-level (static, not traced) sequence
-    of (T, zeta, max_steps) triples -- a continuation schedule for the
-    support sharpness T (passed through as `static["eps"]`, reusing the
-    existing eps-as-softness convention from support.py/multi_support.py)
-    and the anchor weight zeta. Each stage is one `_solve_one_adam`-style
-    `lax.while_loop`; the stages are unrolled in plain Python (there are
-    only ever a handful), so this still traces to a single jaxpr per
-    restart under vmap/jit, and gets a fresh Adam state at each stage
-    boundary (a small, deliberate reset -- the loss landscape genuinely
-    changes shape each time T or zeta changes, so stale second-moment
-    estimates from the previous stage aren't worth carrying over).
+    The optimization advances `chunk` steps at a time, so it can be stopped
+    between chunks: interrupt the kernel (or press Ctrl-C) and the result so
+    far is returned instead of an exception. Pass it back as `resume=result`
+    to continue from the same parameters, optimizer state and step count, with
+    new values of `eps`, `alpha`, `beta`, `learning_rate`, `tol` or `max_steps`
+    (a total number of steps, not an increment). Changing these does not
+    recompile. Everything else must be as in the first call; `key`, `n_restarts`
+    and the model arguments are ignored when resuming. An interrupt takes
+    effect when the current chunk finishes.
     """
-    params = params0
-    final_value = jnp.asarray(jnp.inf, dtype=jnp.float32)
-    total_steps = jnp.asarray(0)
+    Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
 
-    for T_i, zeta_i, steps_i in stage_schedule:
-        stage_static = dict(base_static)
-        stage_static["eps"] = T_i
-        stage_static["zeta"] = zeta_i
-        stage_static["S_ref"] = S_ref
-        params, final_value, steps = _solve_one_adam(
-            params, stage_static, max_steps=steps_i, tol=tol,
-            learning_rate=learning_rate, decay_steps=decay_steps,
-            decay_rate=decay_rate, staircase=staircase,
-            b1=b1, b2=b2, eps_adam=eps_adam,
-        )
-        total_steps = total_steps + steps
-
-    return params, final_value, total_steps
-
-
-def reconstruct_two_stage(
-    key,
-    Iobs,
-    n_restarts_stage1,
-    stage1_support_type="single",
-    n_keep=1,
-    n_restarts_stage2=None,
-    grid_shape=None,
-    stage1_kwargs=None,
-    T_schedule=(1.5, 0.6, 0.25),
-    zeta_schedule=(3.0, 1.0, 0.0),
-    steps_per_stage=1000,
-    gamma=1e-3,
-    delta=1e-2,
-    alpha2=None,
-    beta2=None,
-    noise_scale_support=0.0,
-    noise_scale_phase=0.0,
-    stage2_learning_rate=0.02,
-    stage2_decay_steps=500,
-    stage2_decay_rate=0.9,
-    stage2_staircase=True,
-    stage2_b1=0.9,
-    stage2_b2=0.98,
-    stage2_eps_adam=1e-6,
-    tol=1e-6,
-):
-    """Two-stage reconstruction for non-convex / multi-particle supports:
-    a cheap convex/multi-convex stage 1, then a free-form release for a
-    small population of the best stage-1 candidates.
-
-    Parameters
-    ----------
-    n_restarts_stage1, stage1_support_type : population size and support
-        parameterization ("single" or "multi") for the stage-1 solve --
-        forwarded to `reconstruct` via `stage1_kwargs`.
-    n_keep : how many of the lowest-loss stage-1 restarts to carry into
-        stage 2. Keep this small (1-3): each one becomes an O(D*H*W)-param
-        free-form restart, a very different memory regime than stage 1
-        (see `support_freeform.py`'s and `support.py`'s module docstrings
-        on per-restart memory cost).
-    n_restarts_stage2 : population size for stage 2; defaults to `n_keep`
-        (one free-form restart per kept candidate). If larger, extra
-        restarts are assigned to kept candidates round-robin and
-        decorrelated via `noise_scale_support`/`noise_scale_phase`.
-    stage1_kwargs : dict forwarded to `reconstruct` for stage 1 (N,
-        size_factor, eps, alpha, beta, metric, phase_type, phase_kwargs,
-        support_kwargs, optimizer, max_steps, tol, memory_size,
-        learning_rate, ...). `support_type` is set from
-        `stage1_support_type` if not already present.
-    T_schedule, zeta_schedule : continuation schedule for stage 2 -- same
-        length, T decreasing (support sharpness, see
-        `support_freeform.compute_freeform_support`) and zeta decreasing
-        toward 0 (anchor weight toward the stage-1 shape, see
-        `support_freeform.anchor_penalty`). Defaults are a reasonable
-        starting point, not tuned for any particular dataset.
-    steps_per_stage : Adam steps (or until `tol`) per schedule stage.
-    gamma, delta : perimeter / double-well regularizer weights (see
-        `support_freeform.tv_support` / `double_well_support`), held
-        constant across all stage-2 stages. These do NOT resist splitting
-        into disconnected domains or growing concavities -- both cost the
-        same perimeter per unit boundary area as a convex bulge -- so
-        setting them to 0 to "give the field more freedom" is usually
-        counterproductive: it removes the pressure that keeps voxels
-        decisively in/out, which is what makes a genuine gap between two
-        domains (or a genuine notch) show up as S~0 instead of a blurry
-        S~0.4 compromise.
-    alpha2, beta2 : support-size / phase-TV weights for stage 2, DEFAULT
-        None (reuse stage 1's `alpha`/`beta` from `stage1_kwargs`, for
-        backwards compatibility). Pass these explicitly whenever stage 1
-        used `alpha=0` (common and often correct for the convex/multi-
-        convex parameterization, which cannot represent diffuse background
-        mass at all) -- the free-form support has no such structural
-        protection: every voxel is an independent parameter, so with
-        alpha=0 (and gamma=delta=0) nothing prices total support mass in
-        stage 2, and as T softens, leaked S from the (typically much
-        larger) background volume can dominate `amplitude =
-        sqrt(sum_I / (N*sum_S))` and destabilize the fit. A small nonzero
-        alpha2 (and/or gamma, delta) is usually needed even when stage 1's
-        alpha is legitimately 0.
-    noise_scale_support, noise_scale_phase : stddev of Gaussian noise added
-        to the support logit / phase params of each stage-2 restart on top
-        of its assigned stage-1 warm start -- only matters when
-        `n_restarts_stage2 > n_keep`, to decorrelate restarts that would
-        otherwise be exact duplicates.
-
-    Returns
-    -------
-    stage1_result, stage2_result : both `ReconstructionResult`. On
-    `stage2_result`, `eps` is set to `T_schedule[-1]` (the T needed to
-    reproduce the final support via `.evaluate()`), and `model_static`
-    has `support_type` overridden to `"freeform"`.
-    """
-    if len(T_schedule) != len(zeta_schedule):
-        raise ValueError("T_schedule and zeta_schedule must have the same length")
-
-    key1, key2 = jax.random.split(key)
-    stage1_kwargs = dict(stage1_kwargs or {})
-    stage1_kwargs.setdefault("support_type", stage1_support_type)
-    alpha = stage1_kwargs.get("alpha", 0.8)
-    beta = stage1_kwargs.get("beta", 0.1)
-    metric = stage1_kwargs.get("metric", "mae")
-    alpha_stage2 = alpha if alpha2 is None else alpha2
-    beta_stage2 = beta if beta2 is None else beta2
-
-    stage1_result = reconstruct(
-        key1, Iobs, n_restarts=n_restarts_stage1, grid_shape=grid_shape,
-        **stage1_kwargs,
-    )
-
-    Iobs_arr = jnp.asarray(Iobs, dtype=jnp.float32)
-    coords = stage1_result.coords
-    grid_shape = coords.shape[:3]
-
-    n_keep = min(n_keep, n_restarts_stage1)
-    keep_idx = jnp.argsort(stage1_result.all_losses)[:n_keep]
-    kept_params = jax.tree_util.tree_map(lambda x: x[keep_idx], stage1_result.all_params)
-
-    # Re-evaluate the kept restarts' converged support at stage 1's own
-    # (fixed) eps -- this is the shape stage 2 warm-starts from and
-    # anchors to.
-    kept_forward = jax.vmap(
-        lambda p: forward(p, coords, Iobs_arr, stage1_result.eps, stage1_result.model_static)
-    )
-    kept_support, _kept_amplitude, _kept_phase = kept_forward(kept_params)  # (n_keep, D,H,W)
-    kept_logit = jax.vmap(invert_support_to_logit)(kept_support)            # (n_keep, D,H,W)
-
-    n_restarts_stage2 = n_restarts_stage2 or n_keep
-    assign = jnp.arange(n_restarts_stage2) % n_keep  # round-robin over kept candidates
-    logits0 = kept_logit[assign]
-    phase0 = jax.tree_util.tree_map(lambda x: x[assign], kept_params["phase"])
-    S_ref_batched = kept_support[assign]                                    # (n_restarts_stage2, D,H,W)
-
-    def _init_stage2_one(k, logit0, phase_p0):
-        k_support, k_phase = jax.random.split(k)
-        support_params = init_freeform_support_params(
-            k_support, grid_shape, init_logit=logit0, noise_scale=noise_scale_support
-        )
-        if noise_scale_phase > 0.0:
-            phase_params = jax.tree_util.tree_map(
-                lambda x: x + noise_scale_phase * jax.random.normal(k_phase, x.shape),
-                phase_p0,
-            )
+    if resume is None:
+        if grid_shape is None:
+            grid_shape, coords = make_coords_for(Iobs.shape)
         else:
-            phase_params = phase_p0
-        return {"support": support_params, "phase": phase_params}
+            from .support import make_coords
+            coords = make_coords(grid_shape)
+        params, model_static = init_population(
+            key, n_restarts, grid_shape, N=N, size_factor=size_factor,
+            phase_type=phase_type, phase_kwargs=phase_kwargs,
+            support_type=support_type, support_kwargs=support_kwargs,
+        )
+        solver = _make_solver(
+            learning_rate, decay_steps, decay_rate, staircase, b1, b2, eps_adam,
+            variant, clip_norm,
+        )
+        opt_state = jax.vmap(solver.init)(params)
+        steps = jnp.zeros(n_restarts, dtype=jnp.int32)
+    else:
+        if resume.opt_state is None:
+            raise ValueError("`resume` has no optimizer state; it must come from reconstruct().")
+        params, opt_state, steps = resume.all_params, resume.opt_state, resume.all_steps
+        coords, model_static = resume.coords, resume.model_static
 
-    keys2 = jax.random.split(key2, n_restarts_stage2)
-    params0_stage2 = jax.vmap(_init_stage2_one)(keys2, logits0, phase0)
+    cfg = (metric, stop_amplitude_grad, variant, clip_norm, sign_grad, decay_steps,
+           decay_rate, staircase, b1, b2, eps_adam, _freeze(model_static))
+    hp = {k: float(v) for k, v in
+          dict(eps=eps, alpha=alpha, beta=beta, lr=learning_rate, tol=tol).items()}
+    data = {"coords": coords, "Iobs": Iobs}
 
-    model_static_stage2 = dict(stage1_result.model_static)
-    model_static_stage2["support_type"] = "freeform"
+    # One tuple, replaced in one assignment: an interrupt can never leave it
+    # half updated.
+    carry = (params, opt_state, steps, None)      # (params, opt_state, steps, losses)
+    try:
+        while True:
+            p, s, k, _ = carry
+            new = _advance_population(
+                p, s, k, jnp.minimum(k + chunk, max_steps), data, hp, cfg,
+            )
+            jax.block_until_ready(new)
+            moved = bool(jnp.any(new[2] > k))
+            carry = new
+            if verbose:
+                print(f"\rstep {int(carry[2].max())}/{max_steps}   "
+                      f"best loss {float(carry[3].min()):.6g}", end="", flush=True)
+            if not moved or bool(jnp.all(carry[2] >= max_steps)):
+                break
+        if verbose:
+            print()
+    except KeyboardInterrupt:
+        if carry[3] is None:
+            raise
+        if verbose:
+            print("\ninterrupted: pass resume=result to continue")
+    params, opt_state, steps, values = carry
 
-    base_static = {
-        "coords": coords,
-        "Iobs": Iobs_arr,
-        "alpha": alpha_stage2,
-        "beta": beta_stage2,
-        "metric": metric,
-        "gamma": gamma,
-        "delta": delta,
-        "phase_static": model_static_stage2,
-    }
-    stage_schedule = tuple(
-        (T_i, zeta_i, steps_per_stage) for T_i, zeta_i in zip(T_schedule, zeta_schedule)
+    best_idx = jnp.argmin(values)
+    best_params = jax.tree_util.tree_map(lambda x: x[best_idx], params)
+    return ReconstructionResult(
+        best_params=best_params, best_loss=values[best_idx], all_losses=values,
+        all_steps=steps, coords=coords, model_static=model_static, eps=eps,
+        all_params=params, opt_state=opt_state,
     )
-
-    solve = partial(
-        _solve_one_adam_freeform, base_static=base_static, stage_schedule=stage_schedule,
-        tol=tol, learning_rate=stage2_learning_rate, decay_steps=stage2_decay_steps,
-        decay_rate=stage2_decay_rate, staircase=stage2_staircase,
-        b1=stage2_b1, b2=stage2_b2, eps_adam=stage2_eps_adam,
-    )
-    batched_solve = jax.vmap(solve, in_axes=(0, 0))
-    final_params, final_values, final_steps = batched_solve(params0_stage2, S_ref_batched)
-
-    best_idx = jnp.argmin(final_values)
-    best_params = jax.tree_util.tree_map(lambda x: x[best_idx], final_params)
-
-    stage2_result = ReconstructionResult(
-        best_params=best_params,
-        best_loss=final_values[best_idx],
-        all_losses=final_values,
-        all_steps=final_steps,
-        coords=coords,
-        model_static=model_static_stage2,
-        eps=T_schedule[-1],
-        all_params=final_params,
-    )
-    return stage1_result, stage2_result
