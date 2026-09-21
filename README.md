@@ -25,7 +25,7 @@ cd convexad
 pip install -e ".[examples]"
 ```
 
-The `examples` extra installs `matplotlib` and `scikit-image` for the plotting helpers, and `hdf5plugin` for compressed HDF5 files. This gives JAX on the CPU, which is enough for small problems. For a GPU, install JAX with CUDA support first, following the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html).
+The `examples` extra installs `matplotlib` and `scikit-image` for the plotting helpers, and `hdf5plugin` for compressed HDF5 files. Please install JAX with CUDA support first, following the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html).
 
 The refinement step of the demo notebook uses [PyNX](https://gitlab.esrf.fr/favre/PyNX) and `cdiutils`, which are installed separately. `install_env.sh` builds the full environment used at ESRF (a virtual environment with JAX, PyNX, `cdiutils` and ConvexAD). It is site specific, so edit the paths at the top before using it.
 
@@ -74,7 +74,7 @@ plot_2D_slices_middle_only_phase(obj, unwrap=False)
 ```python
 settings = dict(
     n_restarts=32, N=64, metric="mae",
-    phase_type="displacement", phase_kwargs={"hkl": [2, 2, 2]}, clip_norm=1.0,
+    phase_type="displacement", phase_kwargs={"hkl": [1, 1, 1]}, clip_norm=1.0,
 )
 result = reconstruct(key, Iobs, eps=0.8, alpha=0.0, beta=0.05, max_steps=1000, **settings)
 
@@ -109,7 +109,7 @@ result = reconstruct(
 | `grid_shape` | Object grid. Default: half the shape of `Iobs`. |
 | `resume`, `chunk` | Continue a previous result, and the number of steps between two checks. |
 
-The defaults of `alpha` and `beta` are 0.8 and 0.1, so set them explicitly. See `help(reconstruct)` for the full list.
+The defaults of `alpha` and `beta` are 0.0 and 0.01, so set them explicitly. See `help(reconstruct)` for the full list.
 
 ## How it works
 
