@@ -1,4 +1,4 @@
-# convex-ad
+# ConvexAD
 
 <img width="1240" height="820" alt="image" src="https://github.com/user-attachments/assets/df4366b5-9a40-466b-a82e-a13eff3cfae0" />
 
@@ -86,9 +86,9 @@ Iobs = np.load("data.npz")["I"].astype(np.float32)
 
 result = reconstruct(
     jax.random.PRNGKey(0), Iobs,
-    n_restarts=16, N=64, eps=0.6, alpha=0.8, beta=0.1,
+    n_restarts=16, N=64, eps=0.6, alpha=0.0, beta=0.01,
     metric="mae", phase_type="grid",
-    max_steps=300, tol=1e-6, memory_size=10,
+    max_steps=800,
 )
 support, amplitude, phase = result.evaluate(Iobs)
 ```
