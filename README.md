@@ -44,9 +44,9 @@ key = jax.random.PRNGKey(0)
 result = reconstruct(
     key, Iobs,
     n_restarts=32, N=64,
-    eps=0.8, alpha=0.0, beta=0.05,
+    eps=0.8, alpha=0.0, beta=0.01,
     metric="mae",
-    phase_type="displacement", phase_kwargs={"hkl": [2, 2, 2]},
+    phase_type="displacement", phase_kwargs={"hkl": [1, 1, 1]},
     max_steps=1000, clip_norm=1.0,
 )
 
