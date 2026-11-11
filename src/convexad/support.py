@@ -1,15 +1,27 @@
-import math
+"""Half-space (convex polytope) support for ConvexAD, with dead-plane handling.
+
+Numerics, init and projection:
+  * forward uses log_sigmoid, backward uses sigmoid(-t): exact, no float32 hard zero
+  * planes are parametrised by an unnormalised vector v (n = v/|v|): no pole singularity
+  * no gradient w.r.t. coords (constant input)
+  * Fibonacci-spread, randomly rotated initial normals with jittered offsets
+  * tighten(): one-sided projection pulling planes outside the support back to tangency
+
+Diagnostics and replacement:
+  * plane_activity(): cheap share of the support carried by each plane
+  * plane_health(): leave-one-out "unique cut" per plane -> dead / shadowed / killer
+  * reseed_planes(): re-place dead, duplicate and killer planes (optionally guided by a
+    loss-derived score map)
+"""
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 
-_TINY = 1e-6
-_LOG_TINY = math.log(_TINY)
 
-
-# ----------------------------------------------------------------------------
-# Grid
-# ----------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Coordinates and helpers
+# --------------------------------------------------------------------------- #
 def make_coords(grid_shape):
     D, H, W = grid_shape
     z = jnp.linspace(-(D - 1) / 2.0, (D - 1) / 2.0, D)
@@ -19,183 +31,193 @@ def make_coords(grid_shape):
     return jnp.stack([xx, yy, zz], axis=-1)  # (D, H, W, 3)
 
 
-def _sigma_i(n_i, d_i, coords, eps):
-    dot = jnp.einsum("dhwc,c->dhw", coords, n_i)
-    return jax.nn.sigmoid((d_i - dot) / eps)
+def _t(n_i, d_i, coords, eps):
+    """Signed distance to plane i in units of eps; > 0 means inside the half-space."""
+    return (d_i - jnp.einsum("dhwc,c->dhw", coords, n_i)) / eps
+
+
+def to_unit(v):
+    return v / (jnp.linalg.norm(v, axis=-1, keepdims=True) + 1e-12)
 
 
 def _log_support(n, d, coords, eps):
-    """log S = sum_i log sigma_i, O(DHW) memory."""
+    """log S = sum_i log sigmoid(t_i), O(DHW) memory."""
     def step(logS, nd_i):
         n_i, d_i = nd_i
-        s = _sigma_i(n_i, d_i, coords, eps)
-        return logS + jnp.log(jnp.clip(s, _TINY, 1.0)), None
+        return logS + jax.nn.log_sigmoid(_t(n_i, d_i, coords, eps)), None
 
-    logS0 = jnp.zeros(coords.shape[:3], dtype=coords.dtype)
-    logS, _ = lax.scan(step, logS0, (n, d))
+    logS, _ = lax.scan(step, jnp.zeros(coords.shape[:3], coords.dtype), (n, d))
     return logS
 
 
-# ----------------------------------------------------------------------------
-# Soft polytope indicator with a memory-light custom VJP
-# ----------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Soft polytope indicator with memory-light custom gradient
+# --------------------------------------------------------------------------- #
 @jax.custom_vjp
-def _halfspace_support(n, d, coords, eps, bwd_scale):
+def halfspace_support(n, d, coords, eps):
+    """S(x) = prod_i sigmoid((d_i - n_i.x)/eps). Memory O(D*H*W), not O(D*H*W*N)."""
     return jnp.exp(_log_support(n, d, coords, eps))
 
 
-def _fwd(n, d, coords, eps, bwd_scale):
-    logS = _log_support(n, d, coords, eps)
-    return jnp.exp(logS), (n, d, coords, eps, bwd_scale, logS)
+def _fwd(n, d, coords, eps):
+    S = jnp.exp(_log_support(n, d, coords, eps))
+    return S, (n, d, coords, eps, S)
 
 
 def _bwd(res, g):
-    n, d, coords, eps, k, logS = res
-    eps_b = eps * k
+    n, d, coords, eps, S = res
+    gS = g * S
     flat_coords = coords.reshape(-1, coords.shape[-1])
 
     def per_plane(nd_i):
         n_i, d_i = nd_i
-        arg = d_i - jnp.einsum("dhwc,c->dhw", coords, n_i)
-        s_f = jax.nn.sigmoid(arg / eps)          # forward sigmoid
-        s_b = jax.nn.sigmoid(arg / eps_b)        # (possibly wider) backward one
-        active = (s_f > _TINY).astype(s_f.dtype)  # forward clip => zero grad
-        # leave-one-out support S_{-i} = S / sigma_i, done in log domain
-        loo = jnp.exp(logS - jnp.log(jnp.clip(s_f, _TINY, 1.0)))
-        w = g * loo * active * s_b * (1.0 - s_b) / eps_b
-        dd = jnp.sum(w)
-        dn = -(w.reshape(-1) @ flat_coords)
-        return dn, dd
+        # (1 - sigma)/eps written as sigmoid(-t)/eps: no cancellation, representable
+        # down to ~e^-87 in float32 ((1 - sigma) is exactly 0 beyond t ~ 17).
+        w = gS * jax.nn.sigmoid(-_t(n_i, d_i, coords, eps)) / eps
+        return -(w.reshape(-1) @ flat_coords), jnp.sum(w)
 
-    dn, dd = lax.map(per_plane, (n, d))
-    # coords / eps / bwd_scale are constants: no cotangent, no (D,H,W,3) buffer
-    return dn, dd, None, None, None
+    dn, dd = lax.map(per_plane, (n, d))   # sequential: O(DHW) memory
+    return dn, dd, None, None             # coords and eps are constants
 
 
-_halfspace_support.defvjp(_fwd, _bwd)
+halfspace_support.defvjp(_fwd, _bwd)
 
 
-def halfspace_support(n, d, coords, eps, bwd_scale=1.0):
-    """Soft polytope indicator, memory O(D*H*W).
-
-    bwd_scale > 1 widens the sigmoid in the backward pass only, so planes that
-    are slightly outside the object still receive a (biased) gradient. Use
-    ~2-3 early in training and anneal to 1.0 (exact gradient).
-    """
-    return _halfspace_support(n, d, coords, eps,
-                              jnp.asarray(bwd_scale, coords.dtype))
+def compute_support(params, coords, eps):
+    return halfspace_support(to_unit(params["v"]), params["d"], coords, eps)
 
 
-# ----------------------------------------------------------------------------
-# Normal parameterizations
-# ----------------------------------------------------------------------------
-def stereographic_to_unit(p):
-    """R^2 -> S^2 minus the north pole. p: (..., 2) -> n: (..., 3)."""
-    p2 = jnp.sum(p ** 2, axis=-1, keepdims=True)
-    x = 2.0 * p[..., 0:1]
-    y = 2.0 * p[..., 1:2]
-    z = p2 - 1.0
-    return jnp.concatenate([x, y, z], axis=-1) / (1.0 + p2)
+# --------------------------------------------------------------------------- #
+# Initialisation
+# --------------------------------------------------------------------------- #
+def fibonacci_sphere(N):
+    i = jnp.arange(N) + 0.5
+    z = 1.0 - 2.0 * i / N
+    r = jnp.sqrt(1.0 - z ** 2)
+    phi = jnp.pi * (1.0 + 5.0 ** 0.5) * i
+    return jnp.stack([r * jnp.cos(phi), r * jnp.sin(phi), z], axis=-1)
 
 
-def unit_to_stereographic(n, eps=1e-6):
-    x, y, z = n[..., 0], n[..., 1], n[..., 2]
-    denom = jnp.clip(1.0 - z, eps, None)
-    return jnp.stack([x / denom, y / denom], axis=-1)
-
-
-def normals_from_params(params):
-    """Unit normals. 'n_raw' (default, no singularity) or legacy 'p_raw'."""
-    if "n_raw" in params:
-        v = params["n_raw"]
-        return v / jnp.sqrt(jnp.sum(v ** 2, axis=-1, keepdims=True) + 1e-12)
-    return stereographic_to_unit(params["p_raw"])
-
-
-def _with_normals(params, n_new):
-    out = dict(params)
-    if "n_raw" in params:
-        out["n_raw"] = n_new
-    else:
-        out["p_raw"] = unit_to_stereographic(n_new)
-    return out
-
-
-def init_support_params(key, N, grid_shape, size_factor=4.0):
-    key_n, _ = jax.random.split(key)
-    n0 = jax.random.normal(key_n, (N, 3))
-    n0 = n0 / jnp.linalg.norm(n0, axis=-1, keepdims=True)
+def init_support_params(key, N, grid_shape, size_factor=4.0, d_jitter=0.05):
+    """Evenly spread normals, random rotation per instance, jittered radii."""
+    key_q, key_d = jax.random.split(key)
+    Q, Rm = jnp.linalg.qr(jax.random.normal(key_q, (3, 3)))
+    Q = Q * jnp.sign(jnp.diag(Rm))                      # uniform random rotation/reflection
+    v0 = fibonacci_sphere(N) @ Q.T                      # (N, 3), unit norm
     R = jnp.min(jnp.asarray(grid_shape, dtype=jnp.float32)) / size_factor
-    return {"n_raw": n0, "d": jnp.ones((N,)) * R}
+    d0 = R * (1.0 + d_jitter * jax.random.normal(key_d, (N,)))
+    return {"v": v0, "d": d0}
 
 
-def compute_support(params, coords, eps, bwd_scale=1.0):
-    return halfspace_support(normals_from_params(params), params["d"],
-                             coords, eps, bwd_scale)
+# --------------------------------------------------------------------------- #
+# Diagnostics
+# --------------------------------------------------------------------------- #
+def plane_activity(params, coords, eps):
+    """Share of the support carried by each plane, shape (N,). Cheap.
 
-
-# ----------------------------------------------------------------------------
-# Diagnostics: which planes are dead / redundant / killers?
-# ----------------------------------------------------------------------------
-def plane_health(params, coords, eps):
+    ~0 means the plane neither cuts nor touches the support (it is dead).
+    Cannot tell duplicates apart or detect killers; use plane_health for that.
     """
-    unique_cut[i] in [0,1]: fraction of the volume that would exist WITHOUT
-        plane i which plane i alone removes.
-        ~0  -> dead (outside the object) or shadowed by other planes
-        ~1  -> killer (removes almost everything the others leave)
+    params = lax.stop_gradient(params)
+    n = to_unit(params["v"])
+    S = compute_support(params, coords, eps)
+
+    def act(nd):
+        n_i, d_i = nd
+        return jnp.sum(S * jax.nn.sigmoid(-_t(n_i, d_i, coords, eps)))
+
+    return lax.map(act, (n, params["d"])) / (jnp.sum(S) + 1e-12)
+
+
+def plane_health(params, coords, eps):
+    """Leave-one-out diagnostics.
+
+    unique_cut[i] in [0, 1]: fraction of the volume that would exist WITHOUT plane i
+        which plane i alone removes.
+          ~0 -> dead (outside the object) or shadowed by other planes
+          ~1 -> killer (removes almost everything the others leave)
     nearest_cos[i]: max cosine similarity with any other plane (redundancy).
     """
-    n = lax.stop_gradient(normals_from_params(params))
-    d = lax.stop_gradient(params["d"])
+    params = lax.stop_gradient(params)
+    n = to_unit(params["v"])
+    d = params["d"]
     logS = _log_support(n, d, coords, eps)
-    vol = jnp.sum(jnp.exp(logS))
 
     def per_plane(nd_i):
         n_i, d_i = nd_i
-        s = _sigma_i(n_i, d_i, coords, eps)
-        loo = jnp.exp(logS - jnp.log(jnp.clip(s, _TINY, 1.0)))
-        return jnp.sum(loo * (1.0 - s)), jnp.sum(loo)
+        t = _t(n_i, d_i, coords, eps)
+        loo = jnp.exp(logS - jax.nn.log_sigmoid(t))      # S without plane i
+        return jnp.sum(loo * jax.nn.sigmoid(-t)), jnp.sum(loo)
 
     excl, vol_wo = lax.map(per_plane, (n, d))
     unique_cut = excl / jnp.maximum(vol_wo, 1e-8)
 
     N = n.shape[0]
     cos = jnp.where(jnp.eye(N, dtype=bool), -1.0, n @ n.T)
-    return {"vol": vol, "unique_cut": unique_cut, "nearest_cos": cos.max(axis=1)}
+    return {"vol": jnp.sum(jnp.exp(logS)), "unique_cut": unique_cut,
+            "nearest_cos": cos.max(axis=1)}
 
 
-# ----------------------------------------------------------------------------
-# Smart handling: re-seed dead / redundant / killer planes
-# ----------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
+# Projection: tighten
+# --------------------------------------------------------------------------- #
 def _support_height(n_i, mask, coords, fallback):
     dot = jnp.einsum("dhwc,c->dhw", coords, n_i)
     h = jnp.max(jnp.where(mask, dot, -jnp.inf))
     return jnp.where(jnp.any(mask), h, fallback)
 
 
+def tighten(params, coords, eps, margin=2.0, thresh=0.5):
+    """One-sided projection: pull planes lying outside the support back to tangency.
+
+    d_i <- min(d_i, h_i + margin*eps), with h_i the support function of {S > thresh}
+    along n_i. Planes are never pushed outward, so this does not fight the data term;
+    margin*eps keeps a live gradient at the tangent point. Also renormalises v.
+    Where many planes meet, the {S > thresh} set recedes slightly and tightening can
+    erode the support a little: raise `margin` or lower `thresh` if you see that.
+    """
+    params = lax.stop_gradient(params)
+    n = to_unit(params["v"])
+    inside = compute_support(params, coords, eps) > thresh
+    any_inside = jnp.any(inside)
+    h = lax.map(lambda n_i: _support_height(n_i, inside, coords, -jnp.inf), n)
+    d_new = jnp.where(any_inside, jnp.minimum(params["d"], h + margin * eps), params["d"])
+    return {"v": n, "d": d_new}
+
+
+# --------------------------------------------------------------------------- #
+# Re-seeding of dead / duplicate / killer planes
+# --------------------------------------------------------------------------- #
 def reseed_planes(key, params, coords, eps, *, score=None,
-                  tau_dead=1e-3, tau_dup=5e-2, tau_kill=0.98,
-                  tau_par=0.995, margin=1.0, max_reseed=2):
-    """
-    Move the worst planes to useful places. Call every K steps, outside the
-    hot loop (jit it separately).
+                  tau_dead=1e-3, tau_dup=5e-2, tau_kill=0.98, tau_par=0.995,
+                  margin=2.0, max_reseed=2):
+    """Move the worst planes to useful places. Call every K steps, outside the hot loop.
 
-    score: optional (D,H,W) >= 0 map of "support that should not be there",
-           e.g. S * (1 - normalized_density). New planes are then placed
-           through voxels sampled from it, facing away from the support
-           centroid. Without it they are tangent to the current support in a
-           random direction.
+    flagged planes:
+      killer    unique_cut > tau_kill        -> keep normal, pull back to the support
+                                                of the other planes (+ margin*eps)
+      dead      unique_cut < tau_dead        -> fresh plane (skipped if a killer exists:
+                                                then the others only look dead)
+      duplicate near-parallel (cos > tau_par) to a plane that "beats" it (lower d, or
+                lower index on ties) and unique_cut < tau_dup -> fresh plane
+    Only the `max_reseed` worst planes are moved per call (killers first).
 
-    Returns (new_params, reseed_mask). Use reset_plane_opt_state with the mask.
+    fresh plane: always tangent to the current support (+ margin*eps), so it starts
+    alive without changing the support; the optimizer then decides how far to cut.
+      score given   direction from the support centroid towards a voxel sampled from
+                    `score` (>= 0, (D,H,W), e.g. relu(dLoss/dS) * S); falls back to a
+                    random direction if that voxel coincides with the centroid
+      no score      random direction
+
+    Returns (new_params, reseed_mask).
     """
-    n = normals_from_params(params)
+    params = lax.stop_gradient(params)
+    n = to_unit(params["v"])
     d = params["d"]
     N = n.shape[0]
-    h = plane_health(params, coords, eps)
-    uc = h["unique_cut"]
+    uc = plane_health(params, coords, eps)["unique_cut"]
 
     killer = uc > tau_kill
-    # near-parallel duplicates: j "beats" i if parallel and lower d (tie: index)
     cos = n @ n.T
     idx = jnp.arange(N)
     beats = ((cos > tau_par)
@@ -203,18 +225,14 @@ def reseed_planes(key, params, coords, eps, *, score=None,
                 | ((d[None, :] == d[:, None]) & (idx[None, :] < idx[:, None])))
              & ~jnp.eye(N, dtype=bool))
     dup = jnp.any(beats, axis=1) & (uc < tau_dup)
-    # if a killer exists the others only look dead because S ~ 0: leave them
     dead = (uc < tau_dead) & ~jnp.any(killer)
     flag = killer | dead | dup
 
-    # only the worst max_reseed planes per call (killers first)
     priority = jnp.where(killer, -1.0, jnp.where(flag, uc, jnp.inf))
     rank = jnp.argsort(jnp.argsort(priority))
     mask = flag & (rank < max_reseed)
 
-    # shared quantities from the current support
-    n_sg, d_sg = lax.stop_gradient((n, d))
-    logS = _log_support(n_sg, d_sg, coords, eps)
+    logS = _log_support(n, d, coords, eps)
     S = jnp.exp(logS)
     centroid = (jnp.einsum("dhw,dhwc->c", S, coords)
                 / jnp.maximum(jnp.sum(S), 1e-8))
@@ -226,49 +244,70 @@ def reseed_planes(key, params, coords, eps, *, score=None,
         k_i, n_i, d_i, is_killer = args
 
         def kill_fix(_):
-            # keep the normal, pull back to the support of the other planes
-            s = _sigma_i(n_i, d_i, coords, eps)
-            loo = jnp.exp(logS - jnp.log(jnp.clip(s, _TINY, 1.0)))
+            loo = jnp.exp(logS - jax.nn.log_sigmoid(_t(n_i, d_i, coords, eps)))
             hgt = _support_height(n_i, loo > 0.5, coords, fallback_d)
-            return n_i, hgt - margin
+            return n_i, hgt + margin * eps
 
         def fresh(_):
             k1, k2 = jax.random.split(k_i)
+            v = jax.random.normal(k2, (3,))                     # random fallback direction
             if score is not None:
-                j = jax.random.categorical(
-                    k1, jnp.log(score.reshape(-1) + 1e-12))
-                x_star = flat_coords[j]
-                v = x_star - centroid
-                nn = v / jnp.sqrt(jnp.sum(v ** 2) + 1e-12)
-                return nn, jnp.dot(nn, x_star) - margin
-            v = jax.random.normal(k1, (3,))
-            nn = v / jnp.linalg.norm(v)
+                j = jax.random.categorical(k1, jnp.log(score.reshape(-1) + 1e-12))
+                u = flat_coords[j] - centroid
+                v = jnp.where(jnp.linalg.norm(u) > 1e-3, u, v)  # guard degenerate case
+            nn = v / (jnp.linalg.norm(v) + 1e-12)
             hgt = _support_height(nn, S > 0.5, coords, fallback_d)
-            return nn, hgt - margin
+            return nn, hgt + margin * eps
 
-        return lax.cond(is_killer, kill_fix, fresh, operand=None)
+        return lax.cond(is_killer, kill_fix, fresh, jnp.zeros(()))
 
     def per_plane(args):
         k_i, n_i, d_i, do_it, is_killer = args
-        return lax.cond(do_it,
-                        new_plane,
-                        lambda a: (a[1], a[2]),
+        return lax.cond(do_it, new_plane, lambda a: (a[1], a[2]),
                         (k_i, n_i, d_i, is_killer))
 
     n_new, d_new = lax.map(per_plane, (keys, n, d, mask, killer))
-    new_params = _with_normals(params, n_new)
-    new_params["d"] = d_new
-    return new_params, mask
+    return {"v": n_new, "d": d_new}, mask
 
 
-def reset_plane_opt_state(opt_state, reseed_mask):
-    """Zero per-plane optimizer statistics (Adam mu/nu) of reseeded planes."""
-    N = reseed_mask.shape[0]
+# --------------------------------------------------------------------------- #
+# Self-test
+# --------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    grid = (24, 24, 24)
+    N, eps = 12, 0.6
+    coords = make_coords(grid)
+    params = init_support_params(jax.random.PRNGKey(0), N, grid)
 
-    def f(x):
-        if hasattr(x, "ndim") and x.ndim >= 1 and x.shape[0] == N:
-            m = reseed_mask.reshape((N,) + (1,) * (x.ndim - 1))
-            return jnp.where(m, jnp.zeros_like(x), x)
-        return x
+    # 1) custom gradient vs plain autodiff reference
+    def ref_support(n, d):
+        logS = sum(jax.nn.log_sigmoid(_t(n[i], d[i], coords, eps)) for i in range(N))
+        return jnp.exp(logS)
 
-    return jax.tree_util.tree_map(f, opt_state)
+    wgt = jax.random.normal(jax.random.PRNGKey(1), grid)
+    f_custom = lambda p: jnp.sum(wgt * compute_support(p, coords, eps))
+    f_ref = lambda p: jnp.sum(wgt * ref_support(to_unit(p["v"]), p["d"]))
+    g1, g2 = jax.grad(f_custom)(params), jax.grad(f_ref)(params)
+    for k in ("v", "d"):
+        err = jnp.max(jnp.abs(g1[k] - g2[k])) / (jnp.max(jnp.abs(g2[k])) + 1e-12)
+        print(f"grad {k}: max relative error = {float(err):.2e}")
+
+    # 2) dead planes: push half of them far outside, check tighten
+    dead_p = {"v": params["v"], "d": params["d"].at[: N // 2].set(40.0)}
+    act0 = plane_activity(dead_p, coords, eps)
+    tight = tighten(dead_p, coords, eps)
+    act1 = plane_activity(tight, coords, eps)
+    dS = jnp.max(jnp.abs(compute_support(tight, coords, eps)
+                         - compute_support(dead_p, coords, eps)))
+    print("activity before tighten (dead half):", [f"{a:.1e}" for a in act0[: N // 2]])
+    print("activity after  tighten (same planes):", [f"{a:.1e}" for a in act1[: N // 2]])
+    print(f"max |S_after - S_before| = {float(dS):.2e}")
+
+    # 3) health + reseed: duplicate a plane, add a killer, check detection and repair
+    pd = {"v": params["v"].at[1].set(params["v"][0]), "d": params["d"].at[1].set(params["d"][0] + 0.3)}
+    print("unique_cut with a duplicate:", [f"{u:.2e}" for u in plane_health(pd, coords, eps)["unique_cut"]])
+    pk = {"v": params["v"], "d": params["d"].at[2].set(-30.0)}
+    print("killer unique_cut:", float(plane_health(pk, coords, eps)["unique_cut"][2]))
+    fixed, mask = reseed_planes(jax.random.PRNGKey(3), pk, coords, eps)
+    print("reseeded planes:", jnp.nonzero(mask)[0].tolist(),
+          "| support volume after:", float(compute_support(fixed, coords, eps).sum()))

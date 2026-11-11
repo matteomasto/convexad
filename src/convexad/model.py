@@ -26,7 +26,7 @@ def init_model(key, grid_shape, N=64, size_factor=4.0, phase_type="grid",
     """Initialize a single instance's trainable parameters.
 
     support_type : "single" (default) | "freeform"
-        "single": one convex object, `N` half-spaces.
+        "single": one convex object, `N` half-spaces (params {"v", "d"}).
         "freeform": one free logit per voxel (see support_freeform.py).
             Intended as a stage-2 release from a converged "single" solution.
             `support_kwargs` may contain "init_logit" ((D,H,W) array, typically
@@ -44,7 +44,7 @@ def init_model(key, grid_shape, N=64, size_factor=4.0, phase_type="grid",
     if support_type == "single":
         support_params = init_support_params(
             key_support, N, grid_shape, size_factor,
-            parametrization=support_kwargs.get("parametrization", "unit"),
+            d_jitter=support_kwargs.get("d_jitter", 0.05),
         )
         support_static = {"support_type": "single"}
     elif support_type == "freeform":
@@ -91,19 +91,15 @@ def _amplitude_from(support, Iobs, eps=1e-12, stop_grad=False):
     return amplitude
 
 
-def forward(params, coords, Iobs, eps, model_static, stop_amplitude_grad=False,
-            bwd_scale=1.0):
-    """Single-instance forward pass -> (support, amplitude, phase_or_phasor).
-
-    bwd_scale only affects the half-space ("single") support's backward pass.
-    """
+def forward(params, coords, Iobs, eps, model_static, stop_amplitude_grad=False):
+    """Single-instance forward pass -> (support, amplitude, phase_or_phasor)."""
     support_type = model_static.get("support_type", "single")
     if support_type == "freeform":
         # `eps` doubles as `T`: boundary softness, anneal it down. `coords` is
         # unused: every voxel owns its own parameter.
         support = compute_freeform_support(params["support"], T=eps)
     else:
-        support = compute_support(params["support"], coords, eps, bwd_scale)
+        support = compute_support(params["support"], coords, eps)
 
     amplitude = _amplitude_from(support, Iobs, stop_grad=stop_amplitude_grad)
 
@@ -127,7 +123,7 @@ def loss_fn(params, static):
         "beta": float,           # phase-TV weight
         "metric": "mae" | "poisson",
         "phase_static": {...},   # from init_model
-        optional: "stop_amplitude_grad", "bwd_scale" (default 1.0),
+        optional: "stop_amplitude_grad",
                   "gamma", "delta", "zeta", "S_ref"   (freeform only)
     }
     """
@@ -135,7 +131,6 @@ def loss_fn(params, static):
         params, static["coords"], static["Iobs"], static["eps"],
         static["phase_static"],
         stop_amplitude_grad=static.get("stop_amplitude_grad", False),
-        bwd_scale=static.get("bwd_scale", 1.0),
     )
     return total_loss(
         support, amplitude, phase, static["Iobs"],
