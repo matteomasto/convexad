@@ -223,9 +223,10 @@ def _normalize_support(params):
     return params
 
 
-def _make_tightener(coords, tighten_kw):
-    """Jitted (population params, eps) -> population params with planes tightened."""
-    def fn(params, eps):
+def _make_tightener(tighten_kw):
+    """Jitted (population params, coords, eps) -> population params, planes tightened.
+    coords is an argument (not a closure) so XLA does not constant-fold over it."""
+    def fn(params, coords, eps):
         new_sup = jax.vmap(
             lambda s: tighten(s, coords, eps, **tighten_kw))(params["support"])
         return {**params, "support": new_sup}
@@ -249,10 +250,10 @@ def _cut_score(params, static):
     return jnp.maximum(jax.grad(L)(support), 0.0) * support
 
 
-def _make_reseeder(coords, Iobs, alpha, beta, metric, model_static, reseed_kw,
-                   use_score):
-    """Jitted (key, population params, eps) -> (new params, mask (R, N))."""
-    def fn(key, params, eps):
+def _make_reseeder(alpha, beta, metric, model_static, reseed_kw, use_score):
+    """Jitted (key, population params, coords, Iobs, eps) -> (new params, mask (R, N)).
+    coords and Iobs are arguments (not closures) so XLA does not constant-fold over them."""
+    def fn(key, params, coords, Iobs, eps):
         static = {"coords": coords, "Iobs": Iobs, "eps": eps, "alpha": alpha,
                   "beta": beta, "metric": metric, "phase_static": model_static}
         R = jax.tree_util.tree_leaves(params)[0].shape[0]
@@ -361,9 +362,9 @@ def reconstruct(
     is_single = model_static.get("support_type", "single") == "single"
     if (tighten_every or reseed_every) and not is_single:
         raise ValueError("Plane tightening/reseeding only supports support_type='single'.")
-    tightener = (_make_tightener(coords, dict(tighten_kwargs or {}))
+    tightener = (_make_tightener(dict(tighten_kwargs or {}))
                  if tighten_every else None)
-    reseeder = (_make_reseeder(coords, Iobs, hp["alpha"], hp["beta"], metric,
+    reseeder = (_make_reseeder(hp["alpha"], hp["beta"], metric,
                                dict(model_static), dict(reseed_kwargs or {}),
                                reseed_use_score)
                 if reseed_every else None)
@@ -395,10 +396,11 @@ def reconstruct(
                 p = _normalize_support(p)
                 if (tightener is not None and n_chunks % tighten_every == 0
                         and step_now >= tighten_start):
-                    p = tightener(p, hp["eps"])
+                    p = tightener(p, coords, hp["eps"])
                 if (reseeder is not None and n_chunks % reseed_every == 0
                         and step_now >= reseed_start):
-                    p, mask = reseeder(jax.random.fold_in(key, step_now), p, hp["eps"])
+                    p, mask = reseeder(jax.random.fold_in(key, step_now), p,
+                                       coords, Iobs, hp["eps"])
                     s = _reset_support_opt_state(s, mask)
                 carry = (p, s, st, v)
         if verbose:

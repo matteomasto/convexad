@@ -236,7 +236,8 @@ def reseed_planes(key, params, coords, eps, *, score=None,
     S = jnp.exp(logS)
     centroid = (jnp.einsum("dhw,dhwc->c", S, coords)
                 / jnp.maximum(jnp.sum(S), 1e-8))
-    fallback_d = 0.5 * jnp.max(jnp.abs(coords))
+    # = 0.5 * max|coords|, from the static grid shape (no reduction over the array)
+    fallback_d = 0.25 * (max(coords.shape[:3]) - 1)
     flat_coords = coords.reshape(-1, coords.shape[-1])
     keys = jax.random.split(key, N)
 
