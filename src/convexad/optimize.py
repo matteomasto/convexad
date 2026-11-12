@@ -30,17 +30,33 @@ def init_population(key, n_restarts, grid_shape, N=64, size_factor=4.0,
     """
     keys = jax.random.split(key, n_restarts)
 
+    # size_factor sets the initial support radius R = min(grid) / size_factor.
+    #   scalar        -> the same for every restart (default behaviour)
+    #   (lo, hi)      -> log-spaced from lo to hi across the restarts
+    #   array (n,)    -> one value per restart
+    sf = jnp.asarray(size_factor, jnp.float32)
+    if sf.ndim == 0:
+        sfs = jnp.full((n_restarts,), sf)
+    elif sf.shape == (2,) and n_restarts != 2:
+        sfs = jnp.exp(jnp.linspace(jnp.log(sf[0]), jnp.log(sf[1]), n_restarts))
+    elif sf.shape == (n_restarts,):
+        sfs = sf
+    else:
+        raise ValueError(
+            "size_factor must be a scalar, a (lo, hi) pair, or an array with one "
+            f"value per restart ({n_restarts}); got shape {sf.shape}.")
+
     _, model_static = init_model(
-        keys[0], grid_shape, N=N, size_factor=size_factor,
+        keys[0], grid_shape, N=N, size_factor=sfs[0],
         phase_type=phase_type, phase_kwargs=phase_kwargs,
         support_type=support_type, support_kwargs=support_kwargs,
     )
     init_one = partial(
-        init_params_only, grid_shape=grid_shape, N=N, size_factor=size_factor,
+        init_params_only, grid_shape=grid_shape, N=N,
         phase_type=phase_type, phase_kwargs=phase_kwargs,
         support_type=support_type, support_kwargs=support_kwargs,
     )
-    params0 = jax.vmap(init_one)(keys)
+    params0 = jax.vmap(lambda k, s: init_one(k, size_factor=s))(keys, sfs)
     return params0, model_static
 
 
