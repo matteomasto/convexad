@@ -321,6 +321,8 @@ def reconstruct(
     reseed_start=500,             # ...only once the step count reached this
     reseed_use_score=True,        # place new planes using the loss gradient
     reseed_kwargs=None,           # tau_dead, tau_dup, tau_kill, tau_par, margin, max_reseed
+    maintain_until=0.7,           # tighten/reseed only while step < maintain_until*max_steps
+                                  # (None = always); the rest of the run is pure optimisation
     resume=None, chunk=100, verbose=True,
 ):
     """Run `n_restarts` independent optimizations in parallel and keep the best.
@@ -343,7 +345,9 @@ def reconstruct(
                      Adam statistics)
     Both count chunks (e.g. chunk=100, tighten_every=1 -> every 100 steps). Right
     after either, the stored losses are those from before it, until the next chunk
-    finishes. v is re-normalised after every chunk.
+    finishes. v is re-normalised after every chunk. Maintenance stops once
+    step >= maintain_until * max_steps, so the final stretch of the run is plain
+    optimisation and can converge without being perturbed.
     """
     Iobs = jnp.asarray(Iobs, dtype=jnp.float32)
 
@@ -410,10 +414,12 @@ def reconstruct(
                 p, s, st, v = carry
                 step_now = int(st.max())
                 p = _normalize_support(p)
-                if (tightener is not None and n_chunks % tighten_every == 0
+                maintain = (maintain_until is None
+                            or step_now < maintain_until * max_steps)
+                if (maintain and tightener is not None and n_chunks % tighten_every == 0
                         and step_now >= tighten_start):
                     p = tightener(p, coords, hp["eps"])
-                if (reseeder is not None and n_chunks % reseed_every == 0
+                if (maintain and reseeder is not None and n_chunks % reseed_every == 0
                         and step_now >= reseed_start):
                     p, mask = reseeder(jax.random.fold_in(key, step_now), p,
                                        coords, Iobs, hp["eps"])

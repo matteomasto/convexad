@@ -167,21 +167,25 @@ def _support_height(n_i, mask, coords, fallback):
     return jnp.where(jnp.any(mask), h, fallback)
 
 
-def tighten(params, coords, eps, margin=2.0, thresh=0.5):
-    """One-sided projection: pull planes lying outside the support back to tangency.
+def tighten(params, coords, eps, margin=2.0, thresh=0.5, slack=3.0):
+    """One-sided projection: pull planes lying far outside the support back to tangency.
 
-    d_i <- min(d_i, h_i + margin*eps), with h_i the support function of {S > thresh}
-    along n_i. Planes are never pushed outward, so this does not fight the data term;
-    margin*eps keeps a live gradient at the tangent point. Also renormalises v.
-    Where many planes meet, the {S > thresh} set recedes slightly and tightening can
-    erode the support a little: raise `margin` or lower `thresh` if you see that.
+    With h_i the support function of {S > thresh} along n_i (so h_i <= d_i):
+        d_i <- h_i + margin*eps   only if   d_i > h_i + slack,   else unchanged.
+    Planes are never pushed outward, and planes within `slack` voxels of the support
+    (binding planes: the voxel-discretisation gap and the receding level set at
+    vertices are typically ~1-2 voxels) are never touched. That hysteresis is what keeps
+    tighten from fighting the optimiser near convergence: only genuinely far-away
+    (dead / shadowed) planes move. margin*eps keeps a live gradient at the tangent
+    point. Also renormalises v.
     """
     params = lax.stop_gradient(params)
     n = to_unit(params["v"])
     inside = compute_support(params, coords, eps) > thresh
     any_inside = jnp.any(inside)
     h = lax.map(lambda n_i: _support_height(n_i, inside, coords, -jnp.inf), n)
-    d_new = jnp.where(any_inside, jnp.minimum(params["d"], h + margin * eps), params["d"])
+    far = params["d"] > h + slack
+    d_new = jnp.where(any_inside & far, h + margin * eps, params["d"])
     return {"v": n, "d": d_new}
 
 
