@@ -15,6 +15,8 @@ ConvexAD is a gradient based phase retrieval tool for Bragg coherent diffraction
 * **Optimizers.** AMSGrad, AdaBelief or Lion, with a decaying learning rate and optional gradient clipping.
 * **Pause and resume.** Interrupt a run, inspect the result, change `eps`, `alpha`, `beta` or the learning rate, and continue.
 
+The scientific article describing the algorithm can be found at: https://arxiv.org/abs/2611.05020. Please consider citing the article if using the code. Thanks!
+
 ## Installation
 
 ConvexAD needs Python 3.10 or newer, JAX, optax 0.2.5 or newer and NumPy. It is developed with JAX 0.6.2, optax 0.2.6 and NumPy 2.2.6 on an NVIDIA A40 GPU.
